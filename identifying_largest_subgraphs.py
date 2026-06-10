@@ -2,7 +2,9 @@ import pandas as pd
 import networkx as nx
 from itertools import combinations
 from collections import defaultdict
+from networkx.algorithms import isomorphism as iso
 import random
+import time
 
 # ============================================================
 # FILES
@@ -18,9 +20,24 @@ files = {
 
 SOURCE_COL = "source neuron id"
 TARGET_COL = "target neuron id"
+
 OUT_DIR = "/Users/omikawadhwa/Documents/GitHub/Image Analysis"
 
-random.seed(1)
+# ============================================================
+# PARAMETERS
+# ============================================================
+
+MIN_SIZE = 3
+MAX_SIZE = 20
+MIN_DATASETS = 3
+MAX_CANDIDATES = 2000
+
+RANDOM_SEED = 1
+EXPANSION_WIDTH = 3
+
+USE_WEAKLY_CONNECTED_COMPONENT = True
+
+random.seed(RANDOM_SEED)
 
 # ============================================================
 # LOAD GRAPHS
@@ -30,45 +47,90 @@ def load_graph(path):
     df = pd.read_csv(path)
 
     G = nx.DiGraph()
+
     G.add_edges_from(
-        zip(df[SOURCE_COL].astype(str), df[TARGET_COL].astype(str))
+        zip(
+            df[SOURCE_COL].astype(str),
+            df[TARGET_COL].astype(str)
+        )
     )
 
     G.remove_edges_from(nx.selfloop_edges(G))
+
     return G
 
 
-graphs = {name: load_graph(path) for name, path in files.items()}
+graphs = {
+    name: load_graph(path)
+    for name, path in files.items()
+}
 
+print("\nFull graphs:")
 for name, G in graphs.items():
-    print(name, G.number_of_nodes(), G.number_of_edges())
+    print(
+        name,
+        "nodes:",
+        G.number_of_nodes(),
+        "edges:",
+        G.number_of_edges()
+    )
 
 # ============================================================
-# USE GIANT SCC AS SEARCH SPACE
+# SEARCH SPACE: LARGEST WCC OR SCC
 # ============================================================
 
-def largest_scc(G):
-    nodes = max(nx.strongly_connected_components(G), key=len)
+def largest_wcc(G):
+    nodes = max(
+        nx.weakly_connected_components(G),
+        key=len
+    )
     return G.subgraph(nodes).copy()
 
 
-search_graphs = {
-    name: largest_scc(G)
-    for name, G in graphs.items()
-}
+def largest_scc(G):
+    nodes = max(
+        nx.strongly_connected_components(G),
+        key=len
+    )
+    return G.subgraph(nodes).copy()
 
-print("\nLargest SCCs:")
+
+if USE_WEAKLY_CONNECTED_COMPONENT:
+
+    search_graphs = {
+        name: largest_wcc(G)
+        for name, G in graphs.items()
+    }
+
+    print("\nUsing largest weakly connected components as search space:")
+
+else:
+
+    search_graphs = {
+        name: largest_scc(G)
+        for name, G in graphs.items()
+    }
+
+    print("\nUsing largest strongly connected components as search space:")
+
+
 for name, G in search_graphs.items():
-    print(name, G.number_of_nodes(), G.number_of_edges())
+    print(
+        name,
+        "nodes:",
+        G.number_of_nodes(),
+        "edges:",
+        G.number_of_edges()
+    )
 
 # ============================================================
-# FAST CANONICAL-LIKE SIGNATURE FOR SMALL INDUCED DIGRAPHS
+# SIGNATURE FUNCTION
 # ============================================================
 
 def canonical_signature(S):
     """
-    Hashable signature for small directed induced subgraphs.
-    Converts all nested lists to tuples so it can be used as a dictionary key.
+    Hashable structural signature for a directed induced subgraph.
+    IDs are ignored; only directed connectivity structure contributes.
     """
 
     nodes = list(S.nodes())
@@ -76,6 +138,7 @@ def canonical_signature(S):
     node_features = {}
 
     for n in nodes:
+
         pred_degrees = tuple(
             sorted(
                 S.in_degree(p) + S.out_degree(p)
@@ -122,14 +185,27 @@ def canonical_signature(S):
     )
 
 # ============================================================
-# GROW CONNECTED INDUCED CANDIDATES
+# GROW CONNECTED DIRECTED INDUCED CANDIDATE
 # ============================================================
 
-def grow_candidate(G, seed, size):
+def grow_candidate(
+    G,
+    seed,
+    size,
+    expansion_width=3
+):
+    """
+    Builds a connected local candidate circuit.
+
+    selected = nodes already in candidate
+    frontier = subset of selected nodes used for next expansion
+    """
+
     selected = {seed}
     frontier = {seed}
 
     while len(selected) < size and frontier:
+
         neighbors = set()
 
         for n in frontier:
@@ -141,27 +217,52 @@ def grow_candidate(G, seed, size):
         if not neighbors:
             break
 
-        # mostly high-degree, occasionally random
+        neighbors = list(neighbors)
+
+        # Mostly choose high-degree nodes, sometimes random.
         if random.random() < 0.85:
             nxt = max(
                 neighbors,
                 key=lambda x: G.in_degree(x) + G.out_degree(x)
             )
         else:
-            nxt = random.choice(list(neighbors))
+            nxt = random.choice(neighbors)
 
         selected.add(nxt)
-        frontier = {nxt}
+
+        # Broader than a single-node walk, cheaper than frontier = selected.
+        selected_sorted = sorted(
+            selected,
+            key=lambda x: G.in_degree(x) + G.out_degree(x),
+            reverse=True
+        )
+
+        frontier = set(
+            selected_sorted[:min(expansion_width, len(selected_sorted))]
+        )
 
     if len(selected) != size:
         return None
 
     return G.subgraph(selected).copy()
 
+# ============================================================
+# GENERATE CANDIDATES WITHOUT OVERLAP FILTERING
+# ============================================================
 
-def generate_candidates(G, size, max_candidates=5000):
+def generate_candidates(
+    G,
+    size,
+    max_candidates=5000,
+    expansion_width=3
+):
+    """
+    Generates connected directed induced candidates.
+    No overlap filtering.
+    Only exact duplicate node sets are removed.
+    """
+
     candidates = []
-    seen_node_sets = set()
 
     high_degree_nodes = sorted(
         G.nodes(),
@@ -169,26 +270,43 @@ def generate_candidates(G, size, max_candidates=5000):
         reverse=True
     )
 
-    seeds = high_degree_nodes[:max_candidates]
+    seeds = []
 
+    # high-degree seeds
+    seeds.extend(
+        high_degree_nodes[:min(max_candidates, len(high_degree_nodes))]
+    )
+
+    # random seeds
     if G.number_of_nodes() > max_candidates:
-        seeds += random.sample(
-            list(G.nodes()),
-            max_candidates
+        seeds.extend(
+            random.sample(
+                list(G.nodes()),
+                k=max_candidates
+            )
         )
 
+    seen_exact = set()
+
     for seed in seeds:
-        S = grow_candidate(G, seed, size)
+
+        S = grow_candidate(
+            G,
+            seed=seed,
+            size=size,
+            expansion_width=expansion_width
+        )
 
         if S is None:
             continue
 
-        key = tuple(sorted(S.nodes()))
+        node_key = tuple(sorted(S.nodes()))
 
-        if key in seen_node_sets:
+        # remove only exact duplicate node sets
+        if node_key in seen_exact:
             continue
 
-        seen_node_sets.add(key)
+        seen_exact.add(node_key)
         candidates.append(S)
 
         if len(candidates) >= max_candidates:
@@ -197,7 +315,40 @@ def generate_candidates(G, size, max_candidates=5000):
     return candidates
 
 # ============================================================
-# SIGNATURE SEARCH
+# EXACT VERIFICATION
+# ============================================================
+
+def exact_isomorphic(S1, S2):
+    """
+    Exact directed graph isomorphism between two induced subgraphs.
+    """
+
+    if S1.number_of_nodes() != S2.number_of_nodes():
+        return False, None
+
+    if S1.number_of_edges() != S2.number_of_edges():
+        return False, None
+
+    deg1 = sorted(
+        (S1.in_degree(n), S1.out_degree(n))
+        for n in S1.nodes()
+    )
+
+    deg2 = sorted(
+        (S2.in_degree(n), S2.out_degree(n))
+        for n in S2.nodes()
+    )
+
+    if deg1 != deg2:
+        return False, None
+
+    GM = iso.DiGraphMatcher(S1, S2)
+    ok = GM.is_isomorphic()
+
+    return ok, GM.mapping if ok else None
+
+# ============================================================
+# SEARCH BY SIGNATURE
 # ============================================================
 
 def search_by_signature(
@@ -205,26 +356,40 @@ def search_by_signature(
     min_size=3,
     max_size=20,
     min_datasets=3,
-    max_candidates=10000
+    max_candidates=5000,
+    expansion_width=3
 ):
+    """
+    Size-descending heuristic search.
+
+    Objective:
+        maximize number of nodes N
+
+    Constraint:
+        same directed induced structure appears in >= min_datasets datasets
+    """
 
     best = None
-    all_hits = []
 
     for size in range(max_size, min_size - 1, -1):
 
-        print("\nSearching size", size)
+        size_start = time.time()
+
+        print("\n================================================")
+        print("Searching size:", size)
+        print("================================================")
 
         buckets = defaultdict(list)
 
         for dataset, G in search_graphs.items():
 
-            print("Generating", dataset)
+            print("Generating candidates for", dataset)
 
             candidates = generate_candidates(
                 G,
                 size=size,
-                max_candidates=max_candidates
+                max_candidates=max_candidates,
+                expansion_width=expansion_width
             )
 
             print(dataset, "candidates:", len(candidates))
@@ -244,43 +409,56 @@ def search_by_signature(
         for sig, items in buckets.items():
 
             datasets_present = sorted(
-                set(x["dataset"] for x in items)
+                set(item["dataset"] for item in items)
             )
 
-            if len(datasets_present) >= min_datasets:
+            if len(datasets_present) < min_datasets:
+                continue
 
-                chosen = []
-                used = set()
+            chosen = []
+            used = set()
 
-                for item in items:
-                    if item["dataset"] not in used:
-                        chosen.append(item)
-                        used.add(item["dataset"])
+            for item in items:
 
-                    if len(chosen) >= min_datasets:
-                        break
+                if item["dataset"] not in used:
+                    chosen.append(item)
+                    used.add(item["dataset"])
+
+                if len(chosen) >= min_datasets:
+                    break
+
+            # Exact verification against first chosen graph.
+            ref = chosen[0]
+            verified = [ref]
+            mappings = {}
+
+            for item in chosen[1:]:
+
+                ok, mapping = exact_isomorphic(
+                    ref["graph"],
+                    item["graph"]
+                )
+
+                if ok:
+                    verified.append(item)
+                    mappings[item["dataset"]] = mapping
+
+            if len(verified) >= min_datasets:
 
                 hit = {
                     "size": size,
                     "signature": sig,
-                    "items": chosen,
-                    "datasets": [x["dataset"] for x in chosen],
-                    "n_datasets": len(chosen)
+                    "items": verified,
+                    "datasets": [x["dataset"] for x in verified],
+                    "n_datasets": len(verified),
+                    "mappings": mappings
                 }
 
                 size_hits.append(hit)
-                all_hits.append(hit)
 
-        print(
-            "Hits at size",
-            size,
-            ":",
-            len(size_hits)
-        )
+        print("Hits at size", size, ":", len(size_hits))
+        print("Elapsed for size", size, ":", time.time() - size_start, "seconds")
 
-        # Since we search from large to small,
-        # if we found any hit at this size, this is the largest N.
-        # Choose best among hits of the same size.
         if len(size_hits) > 0:
 
             best = max(
@@ -300,37 +478,127 @@ def search_by_signature(
     return best
 
 # ============================================================
-# RUN
-# ============================================================
-
-hit = search_by_signature(
-    search_graphs,
-    min_size=3,
-    max_size=20,
-    min_datasets=3,
-    max_candidates=1000
-)
-
-# ============================================================
 # SAVE SOLUTION
 # ============================================================
 
-if hit is None:
-    print("No match found.")
-else:
-    # The ordering inside canonical signature is not directly stored,
-    # so save node sets first.
-    # Then verify manually/with VF2 on these tiny graphs.
+def save_solution(hit, out_dir):
+
+    if hit is None:
+        print("\nNo shared motif found.")
+        return None
 
     items = hit["items"]
 
-    solution = pd.DataFrame({
-        item["dataset"]: item["nodes"]
-        for item in items
-    })
+    # Use first verified item as reference order.
+    ref_item = items[0]
+    ref_dataset = ref_item["dataset"]
+    ref_nodes = list(ref_item["graph"].nodes())
 
-    out = f"{OUT_DIR}/network.csv"
-    solution.to_csv(out, index=False)
+    solution = pd.DataFrame()
+    solution[ref_dataset] = ref_nodes
 
-    print("Saved:", out)
+    for item in items[1:]:
+
+        dataset = item["dataset"]
+
+        ok, mapping = exact_isomorphic(
+            ref_item["graph"],
+            item["graph"]
+        )
+
+        if not ok:
+            raise RuntimeError(
+                f"Unexpected verification failure for {dataset}"
+            )
+
+        # mapping is ref_node -> item_node
+        solution[dataset] = [
+            mapping[n]
+            for n in ref_nodes
+        ]
+
+    out_path = (
+        f"{out_dir}/network.csv"
+    )
+
+    solution.to_csv(
+        out_path,
+        index=False
+    )
+
+    print("\nSaved solution:")
+    print(out_path)
+
+    print("\nSolution shape:", solution.shape)
     print(solution.head())
+
+    return solution
+
+# ============================================================
+# FINAL VERIFICATION
+# ============================================================
+
+def verify_solution(solution, full_graphs):
+
+    print("\nFinal verification:")
+
+    subgraphs = {}
+
+    for dataset in solution.columns:
+
+        nodes = solution[dataset].astype(str).tolist()
+
+        S = full_graphs[dataset].subgraph(nodes).copy()
+
+        subgraphs[dataset] = S
+
+        print(
+            dataset,
+            "nodes:",
+            S.number_of_nodes(),
+            "edges:",
+            S.number_of_edges()
+        )
+
+    for d1, d2 in combinations(solution.columns, 2):
+
+        ok, _ = exact_isomorphic(
+            subgraphs[d1],
+            subgraphs[d2]
+        )
+
+        print(
+            d1,
+            "vs",
+            d2,
+            "isomorphic:",
+            ok
+        )
+
+# ============================================================
+# RUN
+# ============================================================
+
+start = time.time()
+
+hit = search_by_signature(
+    search_graphs,
+    min_size=MIN_SIZE,
+    max_size=MAX_SIZE,
+    min_datasets=MIN_DATASETS,
+    max_candidates=MAX_CANDIDATES,
+    expansion_width=EXPANSION_WIDTH
+)
+
+print("\nTotal elapsed seconds:", time.time() - start)
+
+solution = save_solution(
+    hit,
+    OUT_DIR
+)
+
+if solution is not None:
+    verify_solution(
+        solution,
+        graphs
+    )

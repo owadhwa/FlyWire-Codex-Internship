@@ -1,50 +1,76 @@
 # FlyWire Codex Internship
 
-# Technical Approach Summary
+# Conserved Directed Microcircuit Search Across Connectomes
 
 ## Overview
 
-This pipeline identifies candidate conserved directed microcircuits across multiple large-scale connectomic datasets by searching for recurrent induced subgraph structures within strongly connected regions of each graph. The method combines graph-theoretic preprocessing, stochastic subgraph growth, canonical graph signatures, and cross-dataset motif matching to efficiently detect putatively homologous local circuit architectures.
+This project identifies candidate conserved directed microcircuits across multiple large-scale Drosophila connectomic datasets by searching for recurrent induced subgraph structures shared between independently reconstructed connectomes.
 
-The analysis is performed across five connectomic datasets:
+The pipeline combines:
+
+* graph-theoretic preprocessing,
+* stochastic local subgraph growth,
+* canonical structural signatures,
+* cross-dataset motif matching,
+* and exact directed graph isomorphism verification.
+
+The analysis was performed across three FlyWire Codex datasets:
 
 * MCNS
 * BANC
 * FAFB
-* MAOL
-* MANC
 
-Each dataset is represented as a directed graph in which nodes correspond to neurons and edges correspond to synaptic connectivity.
+Each dataset is represented as a directed graph in which:
+
+* nodes correspond to neurons,
+* directed edges correspond to synaptic connectivity.
+
+Edge weights (synapse counts) were ignored for this analysis.
 
 ---
 
 # 1. Graph Construction
 
-Each connectome edge list is loaded into a directed graph (`networkx.DiGraph`) using neuron identifiers as nodes and synaptic connections as directed edges.
+Each connectome edge list is loaded into a directed graph (`networkx.DiGraph`) using neuron identifiers as graph nodes and synaptic connections as directed edges.
 
 Self-loops are removed to avoid trivial recurrence motifs.
 
 ```python
 G = nx.DiGraph()
-G.add_edges_from(zip(source_ids, target_ids))
-G.remove_edges_from(nx.selfloop_edges(G))
+
+G.add_edges_from(
+    zip(source_ids, target_ids)
+)
+
+G.remove_edges_from(
+    nx.selfloop_edges(G)
+)
 ```
 
-The resulting graph representation preserves directed connectivity patterns necessary for identifying recurrent circuit motifs.
+The resulting graph preserves directed connectivity structure necessary for identifying recurrent local circuit motifs.
 
 ---
 
-# 2. Restricting the Search Space to the Largest Strongly Connected Component
+# 2. Restricting the Search Space
 
-To reduce computational complexity and focus the analysis on recurrent circuitry, the search is restricted to the largest strongly connected component (SCC) of each connectome.
+The full connectomes contain hundreds of thousands of neurons and millions of edges, making exhaustive induced-subgraph search computationally intractable.
+
+To focus the search on biologically relevant local circuitry, the analysis was restricted to neighborhoods surrounding manually identified corresponding neurons across datasets.
+
+For each dataset:
+
+1. seed neurons were selected,
+2. local neighborhoods were expanded by traversing incoming and outgoing connections,
+3. induced local subgraphs were constructed.
 
 ```python
-nodes = max(nx.strongly_connected_components(G), key=len)
+new_nodes.update(G.predecessors(n))
+new_nodes.update(G.successors(n))
 ```
 
-This step removes disconnected or weakly connected peripheral regions and enriches the search space for recurrent motifs capable of supporting feedback dynamics.
+This procedure enriches the search space for recurrent local circuitry while substantially reducing computational complexity.
 
-Biologically, strongly connected regions are more likely to contain local recurrent subnetworks involved in gain control, attractor dynamics, normalization, or recurrent integration.
+The resulting search graphs preserve directed connectivity structure within local neighborhoods surrounding putatively homologous neurons.
 
 ---
 
@@ -54,7 +80,7 @@ The pipeline searches for conserved induced subgraphs of size `N` using a stocha
 
 ## 3.1 Seed Selection
 
-Candidate generation begins from high-degree nodes, under the assumption that densely connected neurons are more likely to participate in recurrent motifs.
+Candidate generation begins from high-degree nodes under the assumption that densely connected neurons are more likely to participate in recurrent motifs.
 
 ```python
 high_degree_nodes = sorted(
@@ -70,7 +96,7 @@ Additional random seeds are sampled to improve exploration of graph space.
 
 ## 3.2 Stochastic Neighborhood Expansion
 
-Subgraphs are grown iteratively from a seed node by adding neighboring nodes connected via incoming or outgoing edges.
+Subgraphs are grown iteratively from a seed node by adding neighboring nodes connected through incoming or outgoing edges.
 
 At each step:
 
@@ -86,20 +112,20 @@ neighbors.update(G.predecessors(n))
 neighbors.update(G.successors(n))
 ```
 
-This procedure biases the search toward densely interconnected local circuits while still allowing stochastic exploration.
+This biases the search toward densely interconnected local circuits while still allowing stochastic exploration of graph topology.
 
-The resulting subgraph is treated as an induced directed subgraph.
+The resulting subgraph is treated as a directed induced subgraph.
 
 ---
 
-# 4. Canonical Subgraph Signature
+# 4. Canonical Structural Signatures
 
-Each candidate induced subgraph is converted into a canonical-like signature that approximates graph isomorphism while remaining computationally efficient.
+Each candidate induced subgraph is converted into a canonical-like structural signature that approximates graph isomorphism while remaining computationally efficient.
 
-The signature includes:
+The signature incorporates:
 
 * number of nodes,
-* number of edges,
+* number of directed edges,
 * node in/out degrees,
 * predecessor degree distributions,
 * successor degree distributions,
@@ -118,7 +144,7 @@ Nodes are ordered according to these local structural features, and edges are re
 
 The resulting tuple acts as a hashable structural fingerprint.
 
-This avoids expensive exact isomorphism testing across all candidate subgraphs.
+This allows rapid grouping of candidate motifs without performing expensive exact graph-isomorphism comparisons across all candidate subgraphs.
 
 ---
 
@@ -130,7 +156,7 @@ Candidate signatures from all datasets are pooled into shared buckets.
 buckets[sig].append({...})
 ```
 
-A motif is considered conserved if the same signature appears in at least a specified number of datasets:
+A motif is considered conserved if the same signature appears across at least three datasets.
 
 ```python
 if len(datasets_present) >= min_datasets
@@ -146,13 +172,34 @@ Thus, the first successful match corresponds to the largest conserved candidate 
 
 ---
 
-# 6. Output
+# 6. Exact Directed Isomorphism Verification
+
+Because the canonical signature is only an approximation of graph isomorphism, all candidate motifs are verified using exact directed graph isomorphism.
+
+Verification is performed using the VF2 algorithm implemented in NetworkX:
+
+```python
+GM = iso.DiGraphMatcher(S1, S2)
+GM.is_isomorphic()
+```
+
+This ensures that:
+
+* edge directionality is preserved,
+* induced connectivity structure is identical,
+* node labels themselves are ignored.
+
+Thus, motifs are matched based purely on directed graph topology.
+
+---
+
+# 7. Output
 
 For the best conserved motif:
 
-* node identities are saved,
+* neuron identities are exported,
 * dataset membership is recorded,
-* candidate neuron sets are exported as CSV.
+* matched node correspondences are saved as CSV.
 
 ```python
 solution.to_csv(out, index=False)
@@ -160,31 +207,11 @@ solution.to_csv(out, index=False)
 
 The output enables downstream:
 
-* manual inspection,
-* VF2 isomorphism validation,
+* manual biological inspection,
 * visualization,
 * neurotransmitter annotation,
-* cell-type comparison,
-* connectomic interpretation.
-
----
-
-# Biological Interpretation
-
-This approach is designed to identify candidate conserved local circuit motifs that recur across independently reconstructed nervous systems.
-
-Potential motifs include:
-
-* recurrent inhibitory subnetworks,
-* feedforward inhibition motifs,
-* winner-take-all architectures,
-* normalization circuits,
-* reciprocal excitatory loops,
-* bilateral coordination circuits.
-
-Because the search operates on induced directed connectivity patterns rather than neuron identity labels, the method can detect topologically conserved microcircuits even when constituent neuron types differ across datasets or species.
-
-This framework therefore provides a scalable strategy for identifying potentially conserved computational motifs across connectomes.
+* cell-type analysis,
+* and connectomic interpretation.
 
 ---
 
@@ -192,10 +219,10 @@ This framework therefore provides a scalable strategy for identifying potentiall
 
 Several limitations should be noted:
 
-1. The canonical signature is an approximation and does not guarantee exact graph isomorphism.
+1. The canonical structural signature is an approximation and does not guarantee graph isomorphism.
 2. Stochastic candidate growth may miss rare motifs.
 3. Degree-biased exploration favors dense recurrent circuits over sparse motifs.
-4. Restricting analysis to the largest SCC excludes motifs outside recurrent graph cores.
-5. Connectivity alone does not capture neurotransmitter identity, synaptic weight, or physiology.
+4. Local-neighborhood restriction biases the search toward motifs surrounding manually selected seed neurons.
+5. Connectivity alone does not capture neurotransmitter identity, synaptic strength, physiology, or morphology.
 
-Thus, all candidate motifs should be validated using exact graph-isomorphism algorithms and biological annotation.
+Thus, all candidate motifs should be interpreted as putative conserved microcircuits requiring additional biological validation.
